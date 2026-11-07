@@ -1,0 +1,9 @@
+Package: fi.local.spotifygain
+Name: SpotifyGain
+Version: 0.1.0
+Architecture: iphoneos-arm
+Description: Gain slider on Spotify's equalizer screen
+Maintainer: you
+Author: you
+Section: Tweaks
+Depends: mobilesubstrate
