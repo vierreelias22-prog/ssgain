@@ -1,64 +1,109 @@
 #import <UIKit/UIKit.h>
-#import <objc/runtime.h>
+#import <AudioToolbox/AudioToolbox.h>
+#include <math.h>
 
-// Slider 100% = nostaa kaistoja tämän verran normalisoidussa asteikossa.
-// Spotifyn oma EQ-asteikko päättyy noin arvoon 1.0, joten isompi ei auta.
-static const float kMaxOffset  = 0.5f;
-static const float kClamp      = 1.0f;
-static const float kBassWeight = 1.0f;   // 4 alinta kaistaa (32-250 Hz)
-static const float kOtherWeight = 0.4f;  // muut kaistat
+// Slider 100% = +kMaxDb. Aloita pienellä arvolla ja pidä puhelimen volyymi alhaalla.
+static const float kMaxDb = 20.0f;
+static volatile float gGainLin = 1.0f;
 
-static __weak id gModel;
-static NSArray<NSNumber *> *gBase;
+typedef struct {
+    AudioUnit au;
+    AURenderCallbackStruct orig;
+    AudioStreamBasicDescription fmt;
+    BOOL hasFmt;
+} Slot;
+
+static Slot gSlots[8];
+static int gN = 0;
+
+static int slotFor(AudioUnit u, BOOL create) {
+    for (int i = 0; i < gN; i++) if (gSlots[i].au == u) return i;
+    if (!create || gN >= 8) return -1;
+    memset(&gSlots[gN], 0, sizeof(Slot));
+    gSlots[gN].au = u;
+    return gN++;
+}
+
+static inline float softclip(float v) {
+    float a = fabsf(v);
+    if (a <= 0.9f) return v;
+    float o = 0.9f + 0.1f * tanhf((a - 0.9f) / 0.1f);
+    return v < 0 ? -o : o;
+}
+
+static OSStatus gainCB(void *ref, AudioUnitRenderActionFlags *flags, const AudioTimeStamp *ts,
+                       UInt32 bus, UInt32 frames, AudioBufferList *io) {
+    Slot *s = &gSlots[(int)(intptr_t)ref];
+    OSStatus r = s->orig.inputProc(s->orig.inputProcRefCon, flags, ts, bus, frames, io);
+    float g = gGainLin;
+    if (r != noErr || !io || g == 1.0f || !s->hasFmt) return r;
+    if (flags && (*flags & kAudioUnitRenderAction_OutputIsSilence)) return r;
+    BOOL isFloat = (s->fmt.mFormatFlags & kAudioFormatFlagIsFloat) != 0;
+    for (UInt32 b = 0; b < io->mNumberBuffers; b++) {
+        AudioBuffer *buf = &io->mBuffers[b];
+        if (!buf->mData) continue;
+        if (isFloat && s->fmt.mBitsPerChannel == 32) {
+            float *p = (float *)buf->mData;
+            UInt32 n = buf->mDataByteSize / 4;
+            for (UInt32 k = 0; k < n; k++) p[k] = softclip(p[k] * g);
+        } else if (!isFloat && s->fmt.mBitsPerChannel == 16) {
+            int16_t *p = (int16_t *)buf->mData;
+            UInt32 n = buf->mDataByteSize / 2;
+            for (UInt32 k = 0; k < n; k++)
+                p[k] = (int16_t)(softclip(p[k] / 32768.0f * g) * 32767.0f);
+        }
+    }
+    return r;
+}
+
+%hookf(OSStatus, AudioUnitSetProperty, AudioUnit inUnit, AudioUnitPropertyID inID,
+       AudioUnitScope inScope, AudioUnitElement inElement, const void *inData, UInt32 inDataSize) {
+    if (inID == kAudioUnitProperty_StreamFormat && inData &&
+        inDataSize >= sizeof(AudioStreamBasicDescription)) {
+        int i = slotFor(inUnit, YES);
+        if (i >= 0) {
+            gSlots[i].fmt = *(const AudioStreamBasicDescription *)inData;
+            gSlots[i].hasFmt = YES;
+        }
+    }
+    if (inID == kAudioUnitProperty_SetRenderCallback && inData &&
+        inDataSize >= sizeof(AURenderCallbackStruct)) {
+        AURenderCallbackStruct in = *(const AURenderCallbackStruct *)inData;
+        int i = slotFor(inUnit, YES);
+        if (in.inputProc && i >= 0 && in.inputProc != gainCB) {
+            gSlots[i].orig = in;
+            AURenderCallbackStruct mine = { gainCB, (void *)(intptr_t)i };
+            return %orig(inUnit, inID, inScope, inElement, &mine, inDataSize);
+        }
+    }
+    return %orig;
+}
 
 static void applyGain(float pct) {
-    id m = gModel;
-    if (!m || !gBase.count) return;
-    float off = pct / 100.0f * kMaxOffset;
-    NSMutableArray *out = [NSMutableArray new];
-    for (NSUInteger i = 0; i < gBase.count; i++) {
-        float w = (i < 4) ? kBassWeight : kOtherWeight;
-        float v = gBase[i].floatValue + off * w;
-        [out addObject:@(MAX(-kClamp, MIN(kClamp, v)))];
-    }
-    if ([m respondsToSelector:@selector(setValues:)]) [m performSelector:@selector(setValues:) withObject:out];
-    if ([m respondsToSelector:@selector(applyCoreEqualizer)]) [m performSelector:@selector(applyCoreEqualizer)];
+    gGainLin = powf(10.0f, (pct / 100.0f * kMaxDb) / 20.0f);
 }
 
-static NSString *dumpModel(id m) {
-    NSMutableString *o = [NSMutableString new];
-    id v = nil;
-    @try { v = [m valueForKey:@"values"]; } @catch (id e) {}
-    [o appendFormat:@"values class: %@\nvalues: %@\n", NSStringFromClass([v class]), v];
-    return o;
-}
-
-@interface SPTEqualizerViewController : UIViewController @end
 @interface SPTEqualizerView : UIView @end
-
-%hook SPTEqualizerViewController
-- (void)viewDidAppear:(BOOL)animated {
-    %orig;
-    id m = nil;
-    @try { m = [self valueForKey:@"model"]; } @catch (id e) {}
-    gModel = m;
-}
-%end
 
 %hook SPTEqualizerView
 - (void)didMoveToWindow {
     %orig;
     if (!self.window || [self viewWithTag:0x6741]) return;
     UILabel *l = [UILabel new];
-    l.tag = 0x6741; l.text = @"Gain: 0%"; l.textColor = UIColor.whiteColor;
-    l.font = [UIFont boldSystemFontOfSize:14]; l.userInteractionEnabled = YES;
-    [l addGestureRecognizer:[[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(sg_dump:)]];
+    l.tag = 0x6741;
+    l.text = @"Gain: +0.0 dB";
+    l.textColor = UIColor.whiteColor;
+    l.font = [UIFont boldSystemFontOfSize:14];
     UISlider *s = [UISlider new];
-    s.minimumValue = 0; s.maximumValue = 100;
+    s.minimumValue = 0;
+    s.maximumValue = 100;
+    s.value = 0;
     s.tintColor = [UIColor colorWithRed:0.11 green:0.73 blue:0.33 alpha:1];
-    [s addTarget:self action:@selector(sg_down:) forControlEvents:UIControlEventTouchDown];
     [s addTarget:self action:@selector(sg_changed:) forControlEvents:UIControlEventValueChanged];
-    for (UIView *v in @[l, s]) { v.translatesAutoresizingMaskIntoConstraints = NO; [self addSubview:v]; }
+    for (UIView *v in @[l, s]) {
+        v.translatesAutoresizingMaskIntoConstraints = NO;
+        [self addSubview:v];
+    }
     [NSLayoutConstraint activateConstraints:@[
         [l.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:20],
         [l.bottomAnchor constraintEqualToAnchor:s.topAnchor constant:-4],
@@ -66,26 +111,9 @@ static NSString *dumpModel(id m) {
         [s.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-20],
         [s.bottomAnchor constraintEqualToAnchor:self.safeAreaLayoutGuide.bottomAnchor constant:-16]]];
 }
-%new - (void)sg_down:(UISlider *)s {
-    id v = nil;
-    @try { v = [gModel valueForKey:@"values"]; } @catch (id e) {}
-    gBase = [v isKindOfClass:[NSArray class]] ? [(NSArray *)v copy] : nil;
-}
 %new - (void)sg_changed:(UISlider *)s {
     UILabel *l = (UILabel *)[self viewWithTag:0x6741];
-    if (!gModel) { l.text = @"Gain: no model"; return; }
-    if (!gBase.count) { l.text = @"Gain: values not NSArray"; return; }
-    l.text = [NSString stringWithFormat:@"Gain: %.0f%% (+%.2f)", s.value, s.value / 100.0f * kMaxOffset];
+    l.text = [NSString stringWithFormat:@"Gain: +%.1f dB", s.value / 100.0f * kMaxDb];
     applyGain(s.value);
-}
-%new - (void)sg_dump:(UILongPressGestureRecognizer *)g {
-    if (g.state != UIGestureRecognizerStateBegan) return;
-    NSString *txt = gModel ? dumpModel(gModel) : @"NO MODEL";
-    UIPasteboard.generalPasteboard.string = txt;
-    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"values" message:txt preferredStyle:UIAlertControllerStyleAlert];
-    [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-    UIViewController *vc = self.window.rootViewController;
-    while (vc.presentedViewController) vc = vc.presentedViewController;
-    [vc presentViewController:a animated:YES completion:nil];
 }
 %end
