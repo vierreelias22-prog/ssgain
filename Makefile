@@ -6,3 +6,4 @@ TWEAK_NAME = SpotifyGain
 SpotifyGain_FILES = Tweak.x
 SpotifyGain_CFLAGS = -fobjc-arc
 include $(THEOS_MAKE_PATH)/tweak.mk
+SpotifyGain_FRAMEWORKS = AudioToolbox
