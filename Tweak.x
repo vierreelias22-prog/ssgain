@@ -6,7 +6,7 @@
 // ---- tune these -----------------------------------------------------------
 // Spotify's EQ bands are limited (~±12 dB). 100 dB is not possible: digital audio
 // clips at 0 dBFS, so >~12 dB is just distortion and can hurt ears/speakers.
-static const float kMaxGainDb   = 12.0f;  // slider 100% = this many dB
+static const float kMaxGainDb   = 50.0f;  // slider 100% = this many dB
 static const float kBassWeight  = 1.0f;   // low shelf/low peak get full offset
 static const float kOtherWeight = 0.5f;   // other bands get half (more bass-heavy "gain")
 // Placeholders – replace after dumping SPTEqualizerModel (long-press the slider label):
