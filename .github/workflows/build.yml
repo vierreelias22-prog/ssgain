@@ -5,9 +5,22 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: Randomblock1/theos-action@v1
-      - run: make package
+      - name: Install Theos
+        run: |
+          brew install ldid dpkg make
+          git clone --recursive https://github.com/theos/theos.git $HOME/theos
+          echo "THEOS=$HOME/theos" >> $GITHUB_ENV
+      - name: Build
+        run: gmake package
+      - name: Collect
+        run: |
+          mkdir -p out/x
+          cp packages/*.deb out/
+          dpkg-deb -x packages/*.deb out/x
+          find out/x -name "*.dylib" -exec cp {} out/ \;
       - uses: actions/upload-artifact@v4
         with:
-          name: deb
-          path: packages/*.deb
+          name: SpotifyGain
+          path: |
+            out/*.deb
+            out/*.dylib
