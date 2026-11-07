@@ -1,49 +1,35 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 
-static const float kMaxGainDb   = 50.0f;
-static const float kBassWeight  = 1.0f;
-static const float kOtherWeight = 0.5f;
-static NSString *const kSetBandSel = @"setGain:forBand:";
-static NSString *const kGetBandSel = @"gainForBand:";
-static const NSUInteger kBandCount = 6;
+// Slider 100% = nostaa kaistoja tämän verran normalisoidussa asteikossa.
+// Spotifyn oma EQ-asteikko päättyy noin arvoon 1.0, joten isompi ei auta.
+static const float kMaxOffset  = 0.5f;
+static const float kClamp      = 1.0f;
+static const float kBassWeight = 1.0f;   // 4 alinta kaistaa (32-250 Hz)
+static const float kOtherWeight = 0.4f;  // muut kaistat
 
-static NSMutableArray<NSNumber *> *baseGains;
 static __weak id gModel;
-static __weak id gVC;
+static NSArray<NSNumber *> *gBase;
 
 static void applyGain(float pct) {
     id m = gModel;
-    SEL set = NSSelectorFromString(kSetBandSel), get = NSSelectorFromString(kGetBandSel);
-    if (!m || ![m respondsToSelector:set] || ![m respondsToSelector:get]) return;
-    if (!baseGains) {
-        baseGains = [NSMutableArray new];
-        for (NSUInteger i = 0; i < kBandCount; i++) {
-            float (*g)(id, SEL, NSUInteger) = (void *)[m methodForSelector:get];
-            [baseGains addObject:@(g(m, get, i))];
-        }
+    if (!m || !gBase.count) return;
+    float off = pct / 100.0f * kMaxOffset;
+    NSMutableArray *out = [NSMutableArray new];
+    for (NSUInteger i = 0; i < gBase.count; i++) {
+        float w = (i < 4) ? kBassWeight : kOtherWeight;
+        float v = gBase[i].floatValue + off * w;
+        [out addObject:@(MAX(-kClamp, MIN(kClamp, v)))];
     }
-    float offset = pct / 100.0f * kMaxGainDb;
-    for (NSUInteger i = 0; i < kBandCount; i++) {
-        float w = (i < 2) ? kBassWeight : kOtherWeight;
-        float v = MAX(-kMaxGainDb, MIN(kMaxGainDb, baseGains[i].floatValue + offset * w));
-        void (*s)(id, SEL, float, NSUInteger) = (void *)[m methodForSelector:set];
-        s(m, set, v, i);
-    }
+    if ([m respondsToSelector:@selector(setValues:)]) [m performSelector:@selector(setValues:) withObject:out];
+    if ([m respondsToSelector:@selector(applyCoreEqualizer)]) [m performSelector:@selector(applyCoreEqualizer)];
 }
 
-static NSString *dumpObj(id obj) {
+static NSString *dumpModel(id m) {
     NSMutableString *o = [NSMutableString new];
-    for (Class c = [obj class]; c && c != [NSObject class]; c = class_getSuperclass(c)) {
-        [o appendFormat:@"== %s\n", class_getName(c)];
-        unsigned n;
-        objc_property_t *ps = class_copyPropertyList(c, &n);
-        for (unsigned i = 0; i < n; i++) [o appendFormat:@"@ %s\n", property_getName(ps[i])];
-        free(ps);
-        Method *ms = class_copyMethodList(c, &n);
-        for (unsigned i = 0; i < n; i++) [o appendFormat:@"- %s\n", sel_getName(method_getName(ms[i]))];
-        free(ms);
-    }
+    id v = nil;
+    @try { v = [m valueForKey:@"values"]; } @catch (id e) {}
+    [o appendFormat:@"values class: %@\nvalues: %@\n", NSStringFromClass([v class]), v];
     return o;
 }
 
@@ -53,13 +39,9 @@ static NSString *dumpObj(id obj) {
 %hook SPTEqualizerViewController
 - (void)viewDidAppear:(BOOL)animated {
     %orig;
-    gVC = self;
     id m = nil;
     @try { m = [self valueForKey:@"model"]; } @catch (id e) {}
     gModel = m;
-    UILabel *l = (UILabel *)[self.view viewWithTag:0x6741];
-    if ([l isKindOfClass:[UILabel class]])
-        l.text = m ? @"Gain: 0% (model OK)" : @"Gain: 0% (no model)";
 }
 %end
 
@@ -74,6 +56,7 @@ static NSString *dumpObj(id obj) {
     UISlider *s = [UISlider new];
     s.minimumValue = 0; s.maximumValue = 100;
     s.tintColor = [UIColor colorWithRed:0.11 green:0.73 blue:0.33 alpha:1];
+    [s addTarget:self action:@selector(sg_down:) forControlEvents:UIControlEventTouchDown];
     [s addTarget:self action:@selector(sg_changed:) forControlEvents:UIControlEventValueChanged];
     for (UIView *v in @[l, s]) { v.translatesAutoresizingMaskIntoConstraints = NO; [self addSubview:v]; }
     [NSLayoutConstraint activateConstraints:@[
@@ -83,18 +66,23 @@ static NSString *dumpObj(id obj) {
         [s.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-20],
         [s.bottomAnchor constraintEqualToAnchor:self.safeAreaLayoutGuide.bottomAnchor constant:-16]]];
 }
+%new - (void)sg_down:(UISlider *)s {
+    id v = nil;
+    @try { v = [gModel valueForKey:@"values"]; } @catch (id e) {}
+    gBase = [v isKindOfClass:[NSArray class]] ? [(NSArray *)v copy] : nil;
+}
 %new - (void)sg_changed:(UISlider *)s {
     UILabel *l = (UILabel *)[self viewWithTag:0x6741];
-    l.text = [NSString stringWithFormat:@"Gain: %.0f%% (+%.1f dB)", s.value, s.value / 100.0f * kMaxGainDb];
+    if (!gModel) { l.text = @"Gain: no model"; return; }
+    if (!gBase.count) { l.text = @"Gain: values not NSArray"; return; }
+    l.text = [NSString stringWithFormat:@"Gain: %.0f%% (+%.2f)", s.value, s.value / 100.0f * kMaxOffset];
     applyGain(s.value);
 }
 %new - (void)sg_dump:(UILongPressGestureRecognizer *)g {
     if (g.state != UIGestureRecognizerStateBegan) return;
-    id target = gModel ?: gVC ?: (id)self;
-    NSString *txt = [NSString stringWithFormat:@"%@\n%@", gModel ? @"MODEL" : @"NO MODEL - dumping controller/view", dumpObj(target)];
+    NSString *txt = gModel ? dumpModel(gModel) : @"NO MODEL";
     UIPasteboard.generalPasteboard.string = txt;
-    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Copied to clipboard"
-        message:txt preferredStyle:UIAlertControllerStyleAlert];
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"values" message:txt preferredStyle:UIAlertControllerStyleAlert];
     [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
     UIViewController *vc = self.window.rootViewController;
     while (vc.presentedViewController) vc = vc.presentedViewController;
